@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         CachedGPT
 // @namespace    https://github.com/HiSkyZen/CachedGPT
-// @version      1.0.0
-// @description  Cache and deduplicate ChatGPT conversation requests, back off on 429 responses, and replace intrusive rate-limit dialogs with a quiet status indicator.
-// @description:ko ChatGPT 대화 요청을 캐시·중복 제거하고 429 응답 시 백오프하며, 방해되는 대화 접근 제한 알림을 조용한 상태 표시로 대체합니다.
+// @version      1.1.0
+// @description  Cache ChatGPT sidebar data, reduce repeat requests, and keep cached lists visible during 429 cooldowns.
+// @description:ko ChatGPT 사이드바 데이터를 캐시하여 반복 요청을 줄이고 429 대기 중에도 저장된 목록을 보여줍니다.
 // @author       HiSkyZen
 // @license      MIT
 // @match        https://chatgpt.com/*
@@ -25,11 +25,9 @@
 
     const CFG = {
         LIST_FRESH_MS: 30_000,
-        DETAIL_FRESH_MS: 3_000,
-        MIN_NETWORK_GAP_MS: 1_500,
+        MIN_NETWORK_GAP_MS: 500,
         INITIAL_BACKOFF_MS: 15_000,
         MAX_BACKOFF_MS: 120_000,
-        CACHE_MAX_AGE_MS: 7 * 24 * 60 * 60 * 1000,
         CACHE_MAX_BYTES: 128 * 1024 * 1024,
         SHOW_STATUS: true,
         STATUS_DURATION_MS: 7_000,
@@ -41,24 +39,14 @@
     let dbPromise = null;
     let networkChain = Promise.resolve();
     let lastNetworkStart = 0;
-    let cooldownUntil = 0;
-    let backoffMs = CFG.INITIAL_BACKOFF_MS;
+    const cooldowns = new Map();
+    const invalidatedAt = new Map();
 
     const inflight = new Map();
 
-    const tabNamespace = (() => {
-        const key = '__cachedgpt_namespace';
-        let value = sessionStorage.getItem(key);
-
-        if (!value) {
-            value = crypto.randomUUID
-                ? crypto.randomUUID()
-                : `${Date.now()}-${Math.random()}`;
-            sessionStorage.setItem(key, value);
-        }
-
-        return value;
-    })();
+    const channel = typeof BroadcastChannel === 'function'
+        ? new BroadcastChannel('cachedgpt-sidebar-v1')
+        : null;
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -73,9 +61,8 @@
     }
 
     function getCacheNamespace(input, init) {
-        const headers = mergedHeaders(input, init);
-        const accountId = headers.get('chatgpt-account-id');
-        return accountId ? `account:${accountId}` : `tab:${tabNamespace}`;
+        const accountId = mergedHeaders(input, init).get('chatgpt-account-id');
+        return accountId ? `account:${accountId}` : null;
     }
 
     function getRequestMeta(input, init) {
@@ -83,8 +70,6 @@
         const method = String(
             init?.method || (input instanceof Request ? input.method : 'GET')
         ).toUpperCase();
-
-        if (method !== 'GET') return null;
 
         let url;
         try {
@@ -95,20 +80,36 @@
 
         if (url.origin !== location.origin) return null;
 
+        const namespace = getCacheNamespace(input, init);
+        if (!namespace) return null;
+
         const isNormalList = /^\/backend-api\/conversations\/?$/.test(url.pathname);
         const isProjectList = /^\/backend-api\/gizmos\/[^/]+\/conversations\/?$/.test(url.pathname);
-        const isDetail = /^\/backend-api\/conversation\/[^/]+\/?$/.test(url.pathname);
+        const isProjectSidebar = /^\/backend-api\/gizmos\/snorlax\/sidebar\/?$/.test(url.pathname);
+        const isPins = /^\/backend-api\/pins\/?$/.test(url.pathname);
+        const type = isPins ? 'pins' : isProjectSidebar ? 'sidebar' : 'list';
 
-        if (!isNormalList && !isProjectList && !isDetail) return null;
+        if (method !== 'GET') {
+            const changesSidebar = /^\/backend-api\/(?:conversation(?:s)?|gizmos|pins)(?:\/|$)/.test(url.pathname) &&
+                !/^\/backend-api\/conversation\/init\/?$/.test(url.pathname);
+            return changesSidebar
+                ? { namespace, mutation: true }
+                : null;
+        }
+        if (!isNormalList && !isProjectList && !isProjectSidebar && !isPins) return null;
 
-        const namespace = getCacheNamespace(input, init);
-        const type = isDetail ? 'detail' : 'list';
+        const listKind = isNormalList
+            ? url.searchParams.get('conversation_origin') ||
+              `excluding:${url.searchParams.get('exclude_conversation_origin') || 'none'}`
+            : isPins ? url.searchParams.get('item_type') || 'all' : '';
 
         return {
             url,
             type,
             namespace,
             key: `${namespace}|${url.href}`,
+            bucket: `${namespace}|${url.pathname}|${listKind}`,
+            signal: init?.signal || (input instanceof Request ? input.signal : undefined),
         };
     }
 
@@ -167,6 +168,25 @@
         });
     }
 
+    async function idbMarkStale(namespace) {
+        const db = await openDb();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(CFG.STORE, 'readwrite');
+            const cursor = tx.objectStore(CFG.STORE).index('namespace').openCursor(IDBKeyRange.only(namespace));
+            cursor.onsuccess = () => {
+                const entry = cursor.result;
+                if (!entry) return;
+                if (entry.value.type !== 'detail') {
+                    entry.value.freshUntil = 0;
+                    entry.update(entry.value);
+                }
+                entry.continue();
+            };
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+    }
+
     async function getAllRecords() {
         const db = await openDb();
         return new Promise((resolve, reject) => {
@@ -180,6 +200,15 @@
     async function serializeResponse(response, info) {
         const clone = response.clone();
         const body = await clone.text();
+        let parsed;
+        try {
+            parsed = JSON.parse(body);
+        } catch {
+            return null;
+        }
+        if (info.type === 'pins' ? !Array.isArray(parsed) : !Array.isArray(parsed?.items)) {
+            return null;
+        }
         const headers = {};
 
         for (const [name, value] of clone.headers.entries()) {
@@ -205,6 +234,7 @@
             bytes: new Blob([body]).size,
             storedAt: Date.now(),
             accessedAt: Date.now(),
+            freshUntil: Infinity,
         };
     }
 
@@ -219,23 +249,16 @@
         });
     }
 
-    async function readCache(key, freshMs = Infinity) {
+    async function readCache(info) {
         try {
-            const record = await idbGet(key);
+            const record = await idbGet(info.key);
             if (!record) return null;
-
-            const age = Date.now() - record.storedAt;
-            if (age > CFG.CACHE_MAX_AGE_MS) {
-                await idbDelete([key]);
-                return null;
-            }
-
-            record.accessedAt = Date.now();
-            void idbPut(record).catch(() => {});
 
             return {
                 record,
-                fresh: age <= freshMs,
+                fresh: record.freshUntil !== 0 &&
+                    record.storedAt >= (invalidatedAt.get(info.namespace) || 0) &&
+                    Date.now() - record.storedAt <= CFG.LIST_FRESH_MS,
             };
         } catch (error) {
             console.warn('[CachedGPT] Cache read failed', error);
@@ -243,14 +266,18 @@
         }
     }
 
-    async function saveCache(response, info) {
-        if (!response.ok) return;
+    async function saveCache(response, info, startedAt) {
+        if (response.status !== 200) return;
 
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.toLowerCase().includes('json')) return;
 
         try {
             const record = await serializeResponse(response, info);
+            if (!record) return;
+            if (startedAt < (invalidatedAt.get(info.namespace) || 0)) {
+                record.freshUntil = 0;
+            }
             await idbPut(record);
         } catch (error) {
             console.warn('[CachedGPT] Cache write failed', error);
@@ -270,37 +297,98 @@
         return null;
     }
 
-    async function queuedNetworkFetch(input, init, info) {
+    function getCooldown(bucket) {
+        return cooldowns.get(bucket) || {
+            until: 0,
+            backoffMs: CFG.INITIAL_BACKOFF_MS,
+        };
+    }
+
+    function setCooldown(bucket, state, broadcast = true) {
+        const previous = getCooldown(bucket);
+        cooldowns.set(bucket, {
+            until: Math.max(previous.until, state.until),
+            backoffMs: Math.max(previous.backoffMs, state.backoffMs),
+        });
+        if (broadcast) channel?.postMessage({ type: 'cooldown', bucket, ...cooldowns.get(bucket) });
+    }
+
+    function markCacheStale(namespace, at = Date.now(), broadcast = true) {
+        invalidatedAt.set(namespace, Math.max(invalidatedAt.get(namespace) || 0, at));
+        void idbMarkStale(namespace).catch(error => console.warn('[CachedGPT] Invalidation failed', error));
+        if (broadcast) channel?.postMessage({ type: 'invalidate', namespace, at });
+    }
+
+    if (channel) {
+        channel.onmessage = ({ data }) => {
+            if (!data) return;
+            if (data.type === 'cooldown' && typeof data.bucket === 'string' &&
+                Number.isFinite(data.until) && Number.isFinite(data.backoffMs)) {
+                setCooldown(data.bucket, data, false);
+            } else if (data.type === 'invalidate' && typeof data.namespace === 'string' && Number.isFinite(data.at)) {
+                markCacheStale(data.namespace, data.at, false);
+            }
+        };
+    }
+
+    function cooldownResponse(info, cached) {
+        if (cached?.record) {
+            showStatus(`CachedGPT · 429 cooldown · cached ${formatAge(cached.record.storedAt)} ago`);
+            return responseFromRecord(cached.record, '429-cooldown');
+        }
+        const seconds = Math.ceil(Math.max(0, getCooldown(info.bucket).until - Date.now()) / 1000);
+        return new Response(JSON.stringify({ detail: 'Rate limited; waiting before retrying.' }), {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': String(seconds) },
+        });
+    }
+
+    function formatAge(storedAt) {
+        const minutes = Math.floor(Math.max(0, Date.now() - storedAt) / 60_000);
+        if (minutes < 1) return 'less than a minute';
+        if (minutes < 60) return `${minutes} min`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours} hr`;
+        return `${Math.floor(hours / 24)} days`;
+    }
+
+    async function queuedNetworkFetch(input, init, info, cached) {
         const work = networkChain
             .catch(() => {})
             .then(async () => {
-                const nextAllowed = Math.max(
-                    lastNetworkStart + CFG.MIN_NETWORK_GAP_MS,
-                    cooldownUntil
-                );
-
-                if (nextAllowed > Date.now()) {
-                    await sleep(nextAllowed - Date.now());
+                if (info.signal?.aborted) {
+                    throw new DOMException('The operation was aborted.', 'AbortError');
+                }
+                if (getCooldown(info.bucket).until > Date.now()) {
+                    return cooldownResponse(info, cached);
                 }
 
-                const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
-                if (signal?.aborted) {
+                const wait = lastNetworkStart + CFG.MIN_NETWORK_GAP_MS - Date.now();
+                if (wait > 0) await sleep(wait);
+
+                if (info.signal?.aborted) {
                     throw new DOMException('The operation was aborted.', 'AbortError');
+                }
+                if (getCooldown(info.bucket).until > Date.now()) {
+                    return cooldownResponse(info, cached);
                 }
 
                 lastNetworkStart = Date.now();
+                const startedAt = lastNetworkStart;
                 const response = await nativeFetch(input, init);
 
                 if (response.status === 429) {
                     const retryAfter = parseRetryAfter(response);
-                    const delay = Math.max(retryAfter || 0, backoffMs);
-                    cooldownUntil = Date.now() + delay;
-                    backoffMs = Math.min(backoffMs * 2, CFG.MAX_BACKOFF_MS);
-                    showStatus(`CachedGPT · 429 · ${Math.ceil(delay / 1000)}s cooldown · cache fallback`);
+                    const backoffMs = getCooldown(info.bucket).backoffMs;
+                    const delay = Math.max(retryAfter ?? 0, backoffMs);
+                    setCooldown(info.bucket, {
+                        until: Date.now() + delay,
+                        backoffMs: Math.min(backoffMs * 2, CFG.MAX_BACKOFF_MS),
+                    });
+                    showStatus(`CachedGPT · 429 · ${Math.ceil(delay / 1000)}s cooldown`);
                 } else if (response.ok) {
-                    cooldownUntil = 0;
-                    backoffMs = CFG.INITIAL_BACKOFF_MS;
-                    void saveCache(response, info);
+                    cooldowns.set(info.bucket, { until: 0, backoffMs: CFG.INITIAL_BACKOFF_MS });
+                    await saveCache(response, info, startedAt);
                 }
 
                 return response;
@@ -310,11 +398,12 @@
         return work;
     }
 
-    function fetchWithDedupe(input, init, info) {
+    function fetchWithDedupe(input, init, info, cached) {
+        if (info.signal) return queuedNetworkFetch(input, init, info, cached);
         const existing = inflight.get(info.key);
         if (existing) return existing.then(response => response.clone());
 
-        const promise = queuedNetworkFetch(input, init, info)
+        const promise = queuedNetworkFetch(input, init, info, cached)
             .finally(() => inflight.delete(info.key));
 
         inflight.set(info.key, promise);
@@ -325,17 +414,27 @@
         const info = getRequestMeta(input, init);
         if (!info) return nativeFetch(input, init);
 
-        const freshMs = info.type === 'list' ? CFG.LIST_FRESH_MS : CFG.DETAIL_FRESH_MS;
-        const cached = await readCache(info.key, freshMs);
+        if (info.mutation) {
+            const response = await nativeFetch(input, init);
+            if (response.ok) markCacheStale(info.namespace);
+            return response;
+        }
+
+        const cached = await readCache(info);
 
         if (cached?.fresh) {
             return responseFromRecord(cached.record, 'fresh-cache');
         }
 
+        if (getCooldown(info.bucket).until > Date.now()) {
+            return cooldownResponse(info, cached);
+        }
+
         try {
-            const response = await fetchWithDedupe(input, init, info);
+            const response = await fetchWithDedupe(input, init, info, cached);
 
             if (response.status === 429 && cached?.record) {
+                showStatus(`CachedGPT · 429 · cached ${formatAge(cached.record.storedAt)} ago`);
                 return responseFromRecord(cached.record, '429-fallback');
             }
 
@@ -344,7 +443,7 @@
             if (error?.name === 'AbortError') throw error;
 
             if (cached?.record) {
-                showStatus('CachedGPT · network error · using last cached response');
+                showStatus(`CachedGPT · network error · cached ${formatAge(cached.record.storedAt)} ago`);
                 return responseFromRecord(cached.record, 'network-fallback');
             }
 
@@ -512,18 +611,15 @@
     async function cleanupCache() {
         try {
             const records = await getAllRecords();
-            const now = Date.now();
-
-            const expired = records
-                .filter(record => now - record.storedAt > CFG.CACHE_MAX_AGE_MS)
+            const obsolete = records
+                .filter(record => record.type === 'detail')
                 .map(record => record.key);
+            await idbDelete(obsolete);
 
-            await idbDelete(expired);
-
-            const expiredSet = new Set(expired);
+            const obsoleteSet = new Set(obsolete);
             const live = records
-                .filter(record => !expiredSet.has(record.key))
-                .sort((a, b) => b.accessedAt - a.accessedAt);
+                .filter(record => !obsoleteSet.has(record.key))
+                .sort((a, b) => (b.accessedAt || b.storedAt) - (a.accessedAt || a.storedAt));
 
             let totalBytes = live.reduce((sum, record) => sum + (record.bytes || 0), 0);
             const evict = [];
@@ -543,8 +639,7 @@
 
     console.info('[CachedGPT] active', {
         listCache: `${CFG.LIST_FRESH_MS / 1000}s`,
-        detailCache: `${CFG.DETAIL_FRESH_MS / 1000}s`,
         maxCache: `${CFG.CACHE_MAX_BYTES / 1024 / 1024} MiB`,
-        staleFallback: `${CFG.CACHE_MAX_AGE_MS / 86_400_000} days`,
+        staleFallback: 'until storage limit',
     });
 })();
